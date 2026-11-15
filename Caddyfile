@@ -1,0 +1,9 @@
+{
+	auto_https off
+	admin off
+}
+
+http://containers.localhost, http://docker.local {
+	bind 127.0.0.1 [::1]
+	reverse_proxy 127.0.0.1:9001
+}
