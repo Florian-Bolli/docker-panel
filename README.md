@@ -20,6 +20,8 @@ Type the `http://` explicitly, otherwise the browser may try HTTPS (`SSL_ERROR_R
 - Start / Stop with a loading state ("Starting…", "Stopping…", and "Starting… (health check)" until a health check passes)
 - Clickable links to each container's published ports
 - **Details ▾** dropdown per container:
+  - Ports: published ports (host → container, local-only or reachable from the network) and exposed-but-unpublished ones
+  - Memory: current RAM use (same formula as `docker stats`), against the container's limit or total system RAM
   - Live logs: the last 200 lines, then new lines every 1.5 s
   - Delete container, with a confirmation. Running containers are stopped first. Volumes and images are kept.
 - Extra warning before stopping or deleting `local-proxy`, since the panel's nice addresses depend on it
@@ -95,6 +97,7 @@ All endpoints require `X-Panel: 1`.
 | Method | Path | Does |
 |---|---|---|
 | GET | `/api/containers` | List all containers (id, name, image, state, status, health, ports, project) |
+| GET | `/api/details/<id>` | Ports (exposed + published) and current memory use |
 | GET | `/api/logs/<id>[?since=<sec.nanos>]` | Last 200 log lines, or only lines newer than the cursor; returns `{lines, cursor}` |
 | POST | `/api/start/<id>` | Start |
 | POST | `/api/stop/<id>` | Stop |

@@ -96,6 +96,48 @@ def parse_ts(s):
     return sec, int((frac + "000000000")[:9])
 
 
+def get_details(cid):
+    """Ports (exposed + published) and current memory use of one container."""
+    status, info = docker("GET", f"/containers/{cid}/json")
+    if status != 200:
+        raise LookupError((info or {}).get("message", "container not found"))
+    cfg, hc, ns = info["Config"], info["HostConfig"], info["NetworkSettings"]
+    running = info["State"]["Running"]
+    live = ns.get("Ports") or {}          # actual bindings while running
+    wanted = hc.get("PortBindings") or {}  # configured bindings (also when stopped)
+    keys = set(cfg.get("ExposedPorts") or {}) | set(wanted) | set(live)
+
+    def sort_key(k):
+        num = k.split("/")[0].split("-")[0]
+        return (int(num) if num.isdigit() else 0, k)
+
+    ports = []
+    for k in sorted(keys, key=sort_key):
+        port, _, proto = k.partition("/")
+        binds = (live.get(k) if running else wanted.get(k)) or []
+        pub = {}
+        for b in binds:
+            hp = b.get("HostPort")
+            if hp:
+                pub.setdefault(hp, set()).add(b.get("HostIp") or "0.0.0.0")
+        ports.append({
+            "container": port, "proto": proto or "tcp",
+            "published": [{"port": hp, "ips": sorted(ips)} for hp, ips in sorted(pub.items())],
+        })
+
+    mem = None
+    if running:
+        st, s = docker("GET", f"/containers/{cid}/stats?stream=false&one-shot=true")
+        m = (s or {}).get("memory_stats") or {}
+        if st == 200 and "usage" in m:
+            extra = m.get("stats") or {}
+            # same formula as `docker stats`: subtract reclaimable page cache
+            cache = extra.get("inactive_file", extra.get("total_inactive_file", 0))
+            mem = {"used": max(m["usage"] - cache, 0), "limit": m.get("limit"),
+                   "limited": bool(hc.get("Memory"))}
+    return {"network": hc.get("NetworkMode", ""), "ports": ports, "mem": mem, "running": running}
+
+
 def get_logs(cid, cursor):
     """Return log lines newer than cursor ("sec.nanos"), or the last 200 if none."""
     tty = is_tty(cid)
@@ -157,6 +199,15 @@ button{border:0;border-radius:7px;padding:7px 12px;font:inherit;font-size:13px;c
 button:disabled{opacity:.6;cursor:wait}
 .logbtn .car{transition:transform .15s;display:inline-block}.logbtn[aria-expanded=true] .car{transform:rotate(180deg)}
 .drop{border-top:1px solid var(--line)}
+.facts{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:12px 14px;font-size:13px}
+@media (max-width:600px){.facts{grid-template-columns:1fr}}
+.lbl{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute);margin-bottom:6px;font-weight:600}
+.pline{margin-bottom:4px}.pline code{font:12px ui-monospace,Menlo,monospace}
+.hint{color:var(--mute);font-size:12px}
+.bar{height:6px;background:var(--btn);border-radius:3px;overflow:hidden;margin:6px 0 4px}
+.bar i{display:block;height:100%;background:var(--on);border-radius:3px;transition:width .3s}
+.bar.warn i{background:var(--wait)}.bar.bad i{background:var(--bad)}
+.memval{font-size:18px;font-weight:600}
 .tools{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 14px;font-size:12px;color:var(--mute);flex-wrap:wrap}
 .del{background:transparent;color:var(--bad);border:1px solid var(--bad);padding:5px 10px}
 .del:hover{background:var(--bad);color:#fff}
@@ -198,14 +249,17 @@ function row(c){
     <div class="tools stopwarn" hidden><div class="confirm show"><span class="txt"></span>
       <button class="sno">Cancel</button><button class="yes syes">Yes, stop it</button></div></div>
     <div class="drop" hidden>
+      <div class="facts"><div><div class="lbl">Ports</div><div class="ports hint">loading…</div></div>
+        <div><div class="lbl">Memory</div><div class="mem hint">loading…</div></div></div>
       <div class="tools"><span>Live logs</span><button class="del">Delete container</button>
         <div class="confirm"><span class="txt"></span><button class="no">Cancel</button><button class="yes">Yes, delete</button></div>
       </div><pre class="logs"></pre></div>`;
   const q=s=>el.querySelector(s);
   r={el,parts:{name:q('.name'),meta:q('.meta'),btxt:q('.btxt'),act:q('.act'),logbtn:q('.logbtn'),pre:q('pre'),
      drop:q('.drop'),del:q('.del'),confirm:q('.drop .confirm'),ctxt:q('.drop .confirm .txt'),yes:q('.drop .yes'),no:q('.no'),
-     stopwarn:q('.stopwarn'),stxt:q('.stopwarn .txt'),syes:q('.syes'),sno:q('.sno')},
-     logs:{open:false,cursor:'',timer:null}};
+     stopwarn:q('.stopwarn'),stxt:q('.stopwarn .txt'),syes:q('.syes'),sno:q('.sno'),
+     ports:q('.ports'),mem:q('.mem')},
+     logs:{open:false,cursor:'',timer:null,dtimer:null}};
   r.parts.act.onclick=()=>toggle(c.id);
   r.parts.logbtn.onclick=()=>toggleLogs(c.id);
   r.parts.del.onclick=()=>askDelete(c.id);
@@ -234,7 +288,7 @@ function render(){
     else { p.act.disabled=false; p.act.className='act '+(on?'stop':'start'); p.act.textContent=on?'Stop':'Start'; }
     $list.appendChild(r.el);  // keeps order, moves existing nodes
   }
-  for(const [id,r] of rows) if(!seen.has(id)){ clearTimeout(r.logs.timer); r.el.remove(); rows.delete(id); }
+  for(const [id,r] of rows) if(!seen.has(id)){ clearTimeout(r.logs.timer); clearTimeout(r.logs.dtimer); r.el.remove(); rows.delete(id); }
   document.getElementById('sub').textContent=`${run} running · ${data.length} total`;
 }
 
@@ -282,8 +336,54 @@ function toggleLogs(id){
   L.open=!L.open;
   p.drop.hidden=!L.open; p.logbtn.setAttribute('aria-expanded',L.open);
   p.confirm.classList.remove('show'); p.del.hidden=false;
-  if(L.open){ p.pre.textContent=''; L.cursor=''; pollLogs(id); }
-  else clearTimeout(L.timer);
+  if(L.open){ p.pre.textContent=''; L.cursor=''; p.ports.textContent=p.mem.textContent='loading…'; pollLogs(id); pollDetails(id); }
+  else { clearTimeout(L.timer); clearTimeout(L.dtimer); }
+}
+
+function fmtBytes(b){
+  const u=['B','KB','MB','GB','TB']; let i=0;
+  while(b>=1024 && i<u.length-1){ b/=1024; i++; }
+  return (b>=100||i===0?Math.round(b):b.toFixed(1))+' '+u[i];
+}
+
+function ipLabel(ips){
+  const local=ips.every(ip=>ip==='127.0.0.1'||ip==='::1');
+  return local?'this computer only':'reachable from your network';
+}
+
+function renderPorts(d){
+  if(d.network==='host') return '<div class="hint">Uses the <b>host network</b>: it opens ports directly on this machine, so Docker has no port list for it.</div>';
+  if(!d.ports.length) return '<div class="hint">No ports exposed.</div>';
+  return d.ports.map(p=>{
+    const cp=`<code>${esc(p.container)}/${esc(p.proto)}</code>`;
+    if(!p.published.length) return `<div class="pline">${cp} <span class="hint">· exposed, not published (only other containers can reach it)</span></div>`;
+    return p.published.map(b=>{
+      const host=p.proto==='tcp'?`<a href="http://localhost:${esc(b.port)}" target="_blank"><code>localhost:${esc(b.port)}</code></a>`:`<code>${esc(b.port)}</code>`;
+      return `<div class="pline">${host} → ${cp} <span class="hint">· ${ipLabel(b.ips)}</span></div>`;
+    }).join('');
+  }).join('')+(d.running?'':'<div class="hint">Container is stopped: showing configured ports.</div>');
+}
+
+function renderMem(d){
+  if(!d.mem) return '<div class="hint">Not running.</div>';
+  const {used,limit,limited}=d.mem, pct=limit?used/limit*100:0;
+  const cls=pct>90?' bad':pct>70?' warn':'';
+  const of=limited?`of ${fmtBytes(limit)} limit (${pct.toFixed(0)}%)`:`no limit set · ${pct<0.1?'<0.1':pct.toFixed(1)}% of ${fmtBytes(limit)} system RAM`;
+  return `<div class="memval">${fmtBytes(used)}</div><div class="bar${cls}"><i style="width:${Math.min(pct,100).toFixed(1)}%"></i></div><div class="hint">${of}</div>`;
+}
+
+async function pollDetails(id){
+  const r=rows.get(id); if(!r||!r.logs.open) return;
+  const p=r.parts;
+  try{
+    const res=await fetch(`/api/details/${id}`,{headers:H});
+    const d=await res.json();
+    if(!res.ok) throw new Error(d.error);
+    if(!r.logs.open) return;
+    p.ports.className='ports'; p.ports.innerHTML=renderPorts(d);
+    p.mem.className='mem'; p.mem.innerHTML=renderMem(d);
+  }catch(e){ p.mem.textContent='Error: '+e.message; }
+  r.logs.dtimer=setTimeout(()=>pollDetails(id),3000);
 }
 
 function askDelete(id){
@@ -364,6 +464,13 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/api/containers":
             if self.guard():
                 self.send(200, list_containers())
+        elif len(parts) == 3 and parts[:2] == ["api", "details"] and parts[2].isalnum():
+            if not self.guard():
+                return
+            try:
+                self.send(200, get_details(parts[2]))
+            except LookupError as e:
+                self.send(404, {"error": str(e)})
         elif len(parts) == 3 and parts[:2] == ["api", "logs"] and parts[2].isalnum():
             if not self.guard():
                 return
