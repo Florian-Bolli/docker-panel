@@ -1,0 +1,23 @@
+name: docker-panel
+
+services:
+  panel:
+    build: .
+    image: docker-panel:local
+    container_name: docker-panel
+    restart: always
+    init: true                     # forwards SIGTERM so `docker stop` is instant
+    ports:
+      - "127.0.0.1:9001:9001"      # this computer only
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  proxy:
+    image: caddy:2
+    container_name: local-proxy
+    restart: always
+    network_mode: host             # binds port 80 on loopback (see Caddyfile)
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - panel

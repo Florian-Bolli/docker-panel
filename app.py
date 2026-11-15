@@ -9,13 +9,15 @@ Host header, so random websites can't toggle containers (CSRF / DNS rebinding).
 import calendar
 import http.client
 import json
+import os
 import re
 import socket
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-HOST, PORT = "127.0.0.1", 9001
+# Inside the container the panel listens on 0.0.0.0; Docker publishes it on 127.0.0.1 only.
+HOST, PORT = os.environ.get("PANEL_HOST", "127.0.0.1"), 9001
 SOCK = "/var/run/docker.sock"
 ALLOWED_HOSTS = {f"localhost:{PORT}", f"127.0.0.1:{PORT}", "containers.localhost", "docker.local"}
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07")
@@ -308,24 +310,40 @@ async function load(){
   timer=setTimeout(load, busy?1000:5000);
 }
 
-const PROXY='local-proxy';
-const PROXY_WARN=' <b>local-proxy</b> serves this panel at <b>docker.local</b> and <b>containers.localhost</b>.'
-  +' Those addresses stop working right away, so this page will lose its connection.'
-  +' To get it back, open <a href="http://localhost:9001">http://localhost:9001</a> and start local-proxy there.';
+// Containers this panel depends on: stopping/deleting them gets an extra warning.
+const UP='run <code>docker compose up -d</code> in <code>~/Programs/docker-panel</code>';
+const PROXY_WHAT=' <b>local-proxy</b> serves this panel at <b>docker.local</b> and <b>containers.localhost</b>.'
+  +' Those addresses stop working right away, so this page will lose its connection.';
+const PANEL_WHAT=' <b>docker-panel</b> is this panel. This page stops working right away,'
+  +' and it can\'t be started again from here.';
+const SELF={
+  'local-proxy':{q:'Stop the panel\'s own proxy?',
+    stop:PROXY_WHAT+' To get it back, open <a href="http://localhost:9001">http://localhost:9001</a> and start local-proxy there.',
+    del:PROXY_WHAT+' To get it back, '+UP+'.'},
+  'docker-panel':{q:'Stop the Docker panel itself?',
+    stop:PANEL_WHAT+' To get it back, run <code>docker start docker-panel</code> in a terminal (it also comes back after a reboot).',
+    del:PANEL_WHAT+' To get it back, '+UP+'.'},
+};
 
 async function toggle(id, confirmed){
   const c=data.find(x=>x.id===id); if(!c) return;
   const act=c.state==='running'?'stop':'start';
-  if(act==='stop' && c.name===PROXY && !confirmed){
+  if(act==='stop' && SELF[c.name] && !confirmed){
     const p=rows.get(id).parts;
-    p.stxt.innerHTML='Stop the panel\'s own proxy?'+PROXY_WARN;
+    p.stxt.innerHTML=SELF[c.name].q+SELF[c.name].stop;
     p.stopwarn.hidden=false; return;
   }
   pending.set(id,act); render(); $err.textContent='';
   try{
     const r=await fetch(`/api/${act}/${id}`,{method:'POST',headers:H});
     if(!r.ok){ pending.delete(id); $err.textContent=`${c.name}: `+((await r.json()).error||'failed'); }
-  }catch(e){ pending.delete(id); $err.textContent=`${c.name}: ${e}`; }
+  }catch(e){
+    pending.delete(id);
+    $err.innerHTML=c.name==='docker-panel'
+      ?'The panel is stopping, so this page no longer responds. Run <code>docker start docker-panel</code> to bring it back.'
+      :esc(`${c.name}: ${e}`);
+    if(c.name==='docker-panel') return;
+  }
   await load();
   const now=data.find(x=>x.id===id);
   if(act==='start' && now && now.state!=='running') $err.textContent=`${c.name} exited right after starting: ${now.status}. Open its logs to see why.`;
@@ -392,7 +410,7 @@ function askDelete(id){
     +(c.state==='running'?' It is <b>running</b> and will be stopped first.':'')
     +' This cannot be undone. Its volumes and image are kept'
     +(c.project?`; <code>docker compose up</code> in <b>${esc(c.project)}</b> would recreate it.`:'.')
-    +(c.name===PROXY?'<br><br><b>Warning:</b>'+PROXY_WARN.replace('start local-proxy there','recreate the container from the terminal (Caddyfile in ~/Programs/docker-panel)'):'');
+    +(SELF[c.name]?'<br><br><b>Warning:</b>'+SELF[c.name].del:'');
   p.del.hidden=true; p.confirm.classList.add('show');
 }
 

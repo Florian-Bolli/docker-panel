@@ -2,7 +2,7 @@
 
 A small web page that lists the Docker containers on this machine and lets you start, stop and delete them, and watch their logs.
 
-It is a single Python file (`app.py`) that uses only the standard library. It talks to Docker directly through `/var/run/docker.sock`.
+It is a single Python file (`app.py`) that uses only the standard library. It talks to Docker directly through `/var/run/docker.sock`. It runs in Docker itself, next to a small Caddy proxy, both defined in `docker-compose.yml`.
 
 ## Open it
 
@@ -10,7 +10,7 @@ It is a single Python file (`app.py`) that uses only the standard library. It ta
 |---|---|
 | http://docker.local | `local-proxy` running + `/etc/hosts` entry |
 | http://containers.localhost | `local-proxy` running |
-| http://localhost:9001 | only the panel itself (fallback) |
+| http://localhost:9001 | only the `docker-panel` container (fallback) |
 
 Type the `http://` explicitly, otherwise the browser may try HTTPS (`SSL_ERROR_RX_RECORD_TOO_LONG`) or run a search.
 
@@ -24,40 +24,33 @@ Type the `http://` explicitly, otherwise the browser may try HTTPS (`SSL_ERROR_R
   - Memory: current RAM use (same formula as `docker stats`), against the container's limit or total system RAM
   - Live logs: the last 200 lines, then new lines every 1.5 s
   - Delete container, with a confirmation. Running containers are stopped first. Volumes and images are kept.
-- Extra warning before stopping or deleting `local-proxy`, since the panel's nice addresses depend on it
+- Extra warning before stopping or deleting the panel's own containers: `docker-panel` (the panel itself) and `local-proxy` (its addresses)
 - Refreshes every 5 s (every 1 s while something is starting or stopping)
 
 ## How it runs
 
 ```
-browser ──> local-proxy (Caddy, port 80) ──> app.py (127.0.0.1:9001) ──> /var/run/docker.sock
+browser ──> local-proxy (Caddy, port 80) ──> docker-panel (127.0.0.1:9001) ──> /var/run/docker.sock
 ```
 
-### The panel: systemd user service
+Both containers are in `docker-compose.yml` (compose project `docker-panel`), with `restart: always`, so they come back after a reboot.
 
-Unit file: `~/.config/systemd/user/docker-panel.service`. It starts at boot; lingering is enabled for this user.
-
-```bash
-systemctl --user status docker-panel
-systemctl --user restart docker-panel     # after editing app.py
-journalctl --user -u docker-panel -f      # server logs
-```
-
-### The proxy: `local-proxy` container
-
-Caddy in a container on the host network. It listens on port 80, only on `127.0.0.1` and `::1`. It uses Docker instead of a system install, so no sudo is needed. Config: `Caddyfile` in this folder.
-
-```bash
-docker restart local-proxy                # after editing Caddyfile
-```
-
-To recreate it (for example after deleting it):
+| Container | What | Notes |
+|---|---|---|
+| `docker-panel` | `app.py`, built from `Dockerfile` (python:3.12-alpine) | Published on `127.0.0.1:9001` only. Has a health check. |
+| `local-proxy` | Caddy, config in `Caddyfile` | Host network, listens on port 80 on `127.0.0.1` and `::1` only. No sudo needed. |
 
 ```bash
 cd ~/Programs/docker-panel
-docker run -d --name local-proxy --restart=always --network host \
-  -v "$PWD/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2
+docker compose up -d --build     # start, or apply changes to app.py
+docker compose restart proxy     # after editing Caddyfile
+docker compose logs -f panel     # panel server logs
+docker compose down              # stop and remove both
 ```
+
+If you stop `docker-panel` from inside the panel, the page stops working. Bring it back with `docker start docker-panel`. If one of the two was deleted, `docker compose up -d` recreates it.
+
+You can still run the panel without Docker for development: `python3 app.py` (listens on `127.0.0.1:9001`; stop the container first, because they use the same port).
 
 ### `docker.local`
 
@@ -78,14 +71,15 @@ echo '127.0.0.1 docker.local' | sudo tee -a /etc/hosts
    	reverse_proxy 127.0.0.1:3005
    }
    ```
-2. `docker restart local-proxy`
-3. **For the panel only:** add the hostname to `ALLOWED_HOSTS` in `app.py`, then `systemctl --user restart docker-panel`. Otherwise the panel answers `403 bad host`.
+2. `docker compose restart proxy`
+3. **For the panel only:** add the hostname to `ALLOWED_HOSTS` in `app.py`, then `docker compose up -d --build`. Otherwise the panel answers `403 bad host`.
 
 ## Security
 
 Anyone with access to the panel can control Docker, which is effectively root on this machine. The panel is locked down:
 
-- It listens on `127.0.0.1` only, and the proxy binds to loopback only, so it is not reachable from the network.
+- Its port is published on `127.0.0.1` only, and the proxy binds to loopback only, so it is not reachable from the network.
+- The container mounts the Docker socket and runs as root inside the container. That is no extra power, since socket access already means root.
 - Every request's `Host` header must be in `ALLOWED_HOSTS`. This blocks DNS-rebinding attacks.
 - Every API call must carry the header `X-Panel: 1`. Other websites open in the browser can't send it without a CORS preflight, which the panel never approves. This blocks cross-site requests that would start, stop or delete containers.
 - There is no login. Don't expose it beyond localhost without adding authentication.
